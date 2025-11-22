@@ -323,7 +323,7 @@ Traditional HAL components run in the RTAPI thread, meaning a crash or blocking 
 
 ## 📄 License
 
-[Specify your license here]
+MIT
 
 ## 🙏 Acknowledgments
 
@@ -335,6 +335,6 @@ Traditional HAL components run in the RTAPI thread, meaning a crash or blocking 
 
 **Status:** Alpha - Stress tested but not yet deployed on production CNC hardware
 
-**Contact:** [Your contact info]
 
-**Repository:** [Your GitHub URL]
+
+
