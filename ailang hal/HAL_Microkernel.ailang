@@ -1,0 +1,509 @@
+// HAL_Microkernel.ailang
+// Microkernel with integrated Pin Monitor Service
+
+PrintMessage("HAL Microkernel v1.1 - With Pin Monitor\n")
+
+FixedPool.MicroKernelConfig {
+    "MAX_SERVICES": Initialize=64
+    "MAX_MESSAGES": Initialize=256
+    "SERVICE_STACK_SIZE": Initialize=8192
+    "KERNEL_THREAD_PRIORITY": Initialize=50
+    "MESSAGE_TIMEOUT_US": Initialize=1000
+    "HEARTBEAT_INTERVAL_MS": Initialize=100
+    "IDLE_SLEEP_US": Initialize=10000
+    "BUSY_SLEEP_US": Initialize=100
+    "MAX_PINS": Initialize=256
+    "PIN_SHARED_MEM_SIZE": Initialize=4096
+    "PIN_POLL_INTERVAL_US": Initialize=1000
+    "MAX_RESTART_ATTEMPTS": Initialize=3
+    "RESTART_DELAY_MS": Initialize=1000
+}
+
+FixedPool.ServiceStates {
+    "STATE_UNINITIALIZED": Initialize=0
+    "STATE_READY": Initialize=1
+    "STATE_RUNNING": Initialize=2
+    "STATE_BLOCKED": Initialize=3
+    "STATE_WAITING": Initialize=4
+    "STATE_SUSPENDED": Initialize=5
+    "STATE_TERMINATED": Initialize=6
+}
+
+FixedPool.MessageTypes {
+    "MSG_INIT": Initialize=1
+    "MSG_START": Initialize=2
+    "MSG_STOP": Initialize=3
+    "MSG_DATA": Initialize=4
+    "MSG_COMMAND": Initialize=5
+    "MSG_RESPONSE": Initialize=6
+    "MSG_HEARTBEAT": Initialize=7
+    "MSG_PIN_REGISTER": Initialize=10
+    "MSG_PIN_READ": Initialize=11
+    "MSG_PIN_WRITE": Initialize=12
+    "MSG_SHUTDOWN": Initialize=99
+}
+
+FixedPool.KernelState {
+    "running": Initialize=0
+    "service_count": Initialize=0
+    "message_count": Initialize=0
+    "kernel_tid": Initialize=0
+    "total_messages_processed": Initialize=0
+    "last_heartbeat": Initialize=0
+    "pin_monitor_service_id": Initialize=-1
+}
+
+FixedPool.ServiceRegistry {
+    "services": Initialize=0
+}
+
+FixedPool.MessageQueue {
+    "queue": Initialize=0
+    "head": Initialize=0
+    "tail": Initialize=0
+    "count": Initialize=0
+}
+
+FixedPool.HALInterface {
+    "shared_memory": Initialize=0
+    "command_buffer": Initialize=0
+    "response_buffer": Initialize=0
+    "status_flags": Initialize=0
+    "pin_shared_memory": Initialize=0
+}
+
+FixedPool.PinMonitorState {
+    "pin_count": Initialize=0
+    "last_values": Initialize=0
+    "pin_names": Initialize=0
+    "running": Initialize=1
+}
+
+Function.Kernel.Initialize {
+    Body: {
+        PrintMessage("[KERNEL] Initializing microkernel service layer...\n")
+        ServiceRegistry.services = Allocate(5120)
+        i = 0
+        WhileLoop LessThan(i, MicroKernelConfig.MAX_SERVICES) {
+            slot_offset = Multiply(i, 80)
+            slot_addr = Add(ServiceRegistry.services, slot_offset)
+            StoreValue(slot_addr, ServiceStates.STATE_UNINITIALIZED)
+            StoreValue(Add(slot_addr, 8), 0)
+            StoreValue(Add(slot_addr, 16), 0)
+            StoreValue(Add(slot_addr, 24), 0)
+            StoreValue(Add(slot_addr, 32), 0)
+            StoreValue(Add(slot_addr, 40), 0)
+            StoreValue(Add(slot_addr, 48), 0)
+            StoreValue(Add(slot_addr, 56), 0)
+            StoreValue(Add(slot_addr, 64), 0)
+            StoreValue(Add(slot_addr, 72), 0)
+            i = Add(i, 1)
+        }
+        MessageQueue.queue = Allocate(8192)
+        MessageQueue.head = 0
+        MessageQueue.tail = 0
+        MessageQueue.count = 0
+        HALInterface.shared_memory = Allocate(4096)
+        HALInterface.command_buffer = HALInterface.shared_memory
+        HALInterface.response_buffer = Add(HALInterface.shared_memory, 1024)
+        HALInterface.status_flags = Add(HALInterface.shared_memory, 2048)
+        StoreValue(HALInterface.status_flags, 0)
+        shm_file = "/tmp/hal_pins.shm"
+        shm_fd = SystemCall(2, shm_file, 578, 438)
+        IfCondition LessThan(shm_fd, 0) ThenBlock: {
+            PrintMessage("[KERNEL] ERROR: Failed to create shared memory file\n")
+            ReturnValue(0)
+        }
+        SystemCall(77, shm_fd, MicroKernelConfig.PIN_SHARED_MEM_SIZE)
+        HALInterface.pin_shared_memory = SystemCall(9, 0, MicroKernelConfig.PIN_SHARED_MEM_SIZE, 3, 1, shm_fd, 0)
+        SystemCall(3, shm_fd)
+        IfCondition EqualTo(HALInterface.pin_shared_memory, 0) ThenBlock: {
+            PrintMessage("[KERNEL] ERROR: Failed to map shared memory\n")
+            ReturnValue(0)
+        }
+        StoreValue(HALInterface.pin_shared_memory, 0)
+        StoreValue(Add(HALInterface.pin_shared_memory, 8), 0)
+        PinMonitorState.last_values = Allocate(Multiply(MicroKernelConfig.MAX_PINS, 8))
+        PinMonitorState.pin_names = Allocate(Multiply(MicroKernelConfig.MAX_PINS, 8))
+        i = 0
+        WhileLoop LessThan(i, MicroKernelConfig.MAX_PINS) {
+            StoreValue(Add(PinMonitorState.last_values, Multiply(i, 8)), 0)
+            StoreValue(Add(PinMonitorState.pin_names, Multiply(i, 8)), 0)
+            i = Add(i, 1)
+        }
+        PrintMessage("[KERNEL] Initialization complete\n")
+        PrintMessage("[KERNEL] Service slots: ")
+        PrintNumber(MicroKernelConfig.MAX_SERVICES)
+        PrintMessage("\n[KERNEL] Message queue depth: ")
+        PrintNumber(MicroKernelConfig.MAX_MESSAGES)
+        PrintMessage("\n[KERNEL] Shared memory file: /tmp/hal_pins.shm\n")
+        PrintMessage("[KERNEL] Max restart attempts: ")
+        PrintNumber(MicroKernelConfig.MAX_RESTART_ATTEMPTS)
+        PrintMessage("\n")
+        ReturnValue(1)
+    }
+}
+
+Function.Kernel.RegisterService {
+    Input: handler_ptr: Address
+    Input: user_data: Address
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(KernelState.service_count, MicroKernelConfig.MAX_SERVICES) ThenBlock: {
+            PrintMessage("[KERNEL] ERROR: Service registry full\n")
+            ReturnValue(-1)
+        }
+        service_id = KernelState.service_count
+        slot_offset = Multiply(service_id, 40)
+        slot_addr = Add(ServiceRegistry.services, slot_offset)
+        service_stack = Allocate(MicroKernelConfig.SERVICE_STACK_SIZE)
+        StoreValue(slot_addr, ServiceStates.STATE_READY)
+        StoreValue(Add(slot_addr, 8), 0)
+        StoreValue(Add(slot_addr, 16), handler_ptr)
+        StoreValue(Add(slot_addr, 24), service_stack)
+        StoreValue(Add(slot_addr, 32), user_data)
+        KernelState.service_count = Add(KernelState.service_count, 1)
+        PrintMessage("[KERNEL] Registered service ")
+        PrintNumber(service_id)
+        PrintMessage("\n")
+        ReturnValue(service_id)
+    }
+}
+
+Function.Kernel.StartService {
+    Input: service_id: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(service_id, KernelState.service_count) ThenBlock: {
+            PrintMessage("[KERNEL] ERROR: Invalid service ID\n")
+            ReturnValue(-1)
+        }
+        slot_offset = Multiply(service_id, 40)
+        slot_addr = Add(ServiceRegistry.services, slot_offset)
+        service_state = Dereference(slot_addr)
+        IfCondition NotEqual(service_state, ServiceStates.STATE_READY) ThenBlock: {
+            PrintMessage("[KERNEL] ERROR: Service not in READY state\n")
+            ReturnValue(-1)
+        }
+        pid = ProcessFork()
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            handler_ptr = Dereference(Add(slot_addr, 16))
+            user_data = Dereference(Add(slot_addr, 32))
+            StoreValue(slot_addr, ServiceStates.STATE_RUNNING)
+            PrintMessage("[SERVICE ")
+            PrintNumber(service_id)
+            PrintMessage("] Started in thread ")
+            PrintNumber(ProcessGetTID())
+            PrintMessage("\n")
+            ProcessExit(0)
+        }
+        StoreValue(Add(slot_addr, 8), pid)
+        StoreValue(slot_addr, ServiceStates.STATE_RUNNING)
+        PrintMessage("[KERNEL] Started service ")
+        PrintNumber(service_id)
+        PrintMessage(" with PID ")
+        PrintNumber(pid)
+        PrintMessage("\n")
+        ReturnValue(0)
+    }
+}
+
+Function.Kernel.SendMessage {
+    Input: target_service: Integer
+    Input: msg_type: Integer
+    Input: msg_data: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(MessageQueue.count, MicroKernelConfig.MAX_MESSAGES) ThenBlock: {
+            PrintMessage("[KERNEL] WARNING: Message queue full\n")
+            ReturnValue(-1)
+        }
+        tail = MessageQueue.tail
+        msg_offset = Multiply(tail, 32)
+        msg_addr = Add(MessageQueue.queue, msg_offset)
+        StoreValue(msg_addr, target_service)
+        StoreValue(Add(msg_addr, 8), msg_type)
+        StoreValue(Add(msg_addr, 16), msg_data)
+        StoreValue(Add(msg_addr, 24), KernelState.total_messages_processed)
+        MessageQueue.tail = Modulo(Add(tail, 1), MicroKernelConfig.MAX_MESSAGES)
+        MessageQueue.count = Add(MessageQueue.count, 1)
+        KernelState.total_messages_processed = Add(KernelState.total_messages_processed, 1)
+        ReturnValue(0)
+    }
+}
+
+Function.Kernel.ReceiveMessage {
+    Input: service_id: Integer
+    Output: Address
+    Body: {
+        IfCondition EqualTo(MessageQueue.count, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        head = MessageQueue.head
+        count = MessageQueue.count
+        i = 0
+        WhileLoop LessThan(i, count) {
+            msg_index = Modulo(Add(head, i), MicroKernelConfig.MAX_MESSAGES)
+            msg_offset = Multiply(msg_index, 32)
+            msg_addr = Add(MessageQueue.queue, msg_offset)
+            target = Dereference(msg_addr)
+            IfCondition EqualTo(target, service_id) ThenBlock: {
+                MessageQueue.head = Modulo(Add(head, 1), MicroKernelConfig.MAX_MESSAGES)
+                MessageQueue.count = Subtract(MessageQueue.count, 1)
+                ReturnValue(msg_addr)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.HAL.ReadCommand {
+    Output: Integer
+    Body: {
+        cmd_ptr = HALInterface.command_buffer
+        command = Dereference(cmd_ptr)
+        StoreValue(cmd_ptr, 0)
+        ReturnValue(command)
+    }
+}
+
+Function.HAL.WriteResponse {
+    Input: response: Integer
+    Body: {
+        resp_ptr = HALInterface.response_buffer
+        StoreValue(resp_ptr, response)
+    }
+}
+
+Function.HAL.UpdateStatus {
+    Input: status_bits: Integer
+    Body: {
+        status_ptr = HALInterface.status_flags
+        StoreValue(status_ptr, status_bits)
+    }
+}
+
+Function.PinMonitor.RegisterPin {
+    Input: pin_name: Address
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(PinMonitorState.pin_count, MicroKernelConfig.MAX_PINS) ThenBlock: {
+            PrintMessage("[PIN-MON] ERROR: Pin registry full\n")
+            ReturnValue(-1)
+        }
+        pin_id = PinMonitorState.pin_count
+        offset = Multiply(pin_id, 8)
+        StoreValue(Add(PinMonitorState.pin_names, offset), pin_name)
+        StoreValue(Add(PinMonitorState.last_values, offset), 0)
+        PinMonitorState.pin_count = Add(PinMonitorState.pin_count, 1)
+        StoreValue(HALInterface.pin_shared_memory, PinMonitorState.pin_count)
+        PrintMessage("[PIN-MON] Registered pin ")
+        PrintNumber(pin_id)
+        PrintMessage(": ")
+        PrintMessage(pin_name)
+        PrintMessage("\n")
+        ReturnValue(pin_id)
+    }
+}
+
+Function.PinMonitor.ReadPin {
+    Input: pin_id: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(pin_id, PinMonitorState.pin_count) ThenBlock: {
+            ReturnValue(0)
+        }
+        pin_offset = Add(16, Multiply(pin_id, 8))
+        pin_addr = Add(HALInterface.pin_shared_memory, pin_offset)
+        value = Dereference(pin_addr)
+        ReturnValue(value)
+    }
+}
+
+Function.PinMonitor.WritePin {
+    Input: pin_id: Integer
+    Input: value: Integer
+    Body: {
+        IfCondition GreaterEqual(pin_id, PinMonitorState.pin_count) ThenBlock: {
+            ReturnValue(0)
+        }
+        pin_offset = Add(16, Multiply(pin_id, 8))
+        pin_addr = Add(HALInterface.pin_shared_memory, pin_offset)
+        StoreValue(pin_addr, value)
+        update_flag_addr = Add(HALInterface.pin_shared_memory, 8)
+        StoreValue(update_flag_addr, 1)
+        ReturnValue(1)
+    }
+}
+
+Function.PinMonitor.CheckChanges {
+    Output: Integer
+    Body: {
+        changes = 0
+        i = 0
+        WhileLoop LessThan(i, PinMonitorState.pin_count) {
+            current = PinMonitor.ReadPin(i)
+            offset = Multiply(i, 8)
+            last = Dereference(Add(PinMonitorState.last_values, offset))
+            IfCondition NotEqual(current, last) ThenBlock: {
+                pin_name = Dereference(Add(PinMonitorState.pin_names, offset))
+                PrintMessage("[PIN-MON] Pin ")
+                PrintNumber(i)
+                PrintMessage(" (")
+                PrintMessage(pin_name)
+                PrintMessage(") changed: ")
+                PrintNumber(last)
+                PrintMessage(" -> ")
+                PrintNumber(current)
+                PrintMessage("\n")
+                StoreValue(Add(PinMonitorState.last_values, offset), current)
+                changes = Add(changes, 1)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(changes)
+    }
+}
+
+Function.Kernel.MainLoop {
+    Body: {
+        PrintMessage("[KERNEL] Entering main loop (persistent daemon mode)...\n")
+        KernelState.running = 1
+        KernelState.kernel_tid = ProcessGetTID()
+        PrintMessage("[KERNEL] Thread ID: ")
+        PrintNumber(KernelState.kernel_tid)
+        PrintMessage("\n[KERNEL] Idle sleep: ")
+        PrintNumber(MicroKernelConfig.IDLE_SLEEP_US)
+        PrintMessage("us, Busy sleep: ")
+        PrintNumber(MicroKernelConfig.BUSY_SLEEP_US)
+        PrintMessage("us\n")
+        timespec_buf = Allocate(16)
+        idle_ns = Multiply(MicroKernelConfig.IDLE_SLEEP_US, 1000)
+        busy_ns = Multiply(MicroKernelConfig.BUSY_SLEEP_US, 1000)
+        loop_count = 0
+        work_done = 0
+        WhileLoop EqualTo(KernelState.running, 1) {
+            work_done = 0
+            hal_cmd = HAL.ReadCommand()
+            IfCondition NotEqual(hal_cmd, 0) ThenBlock: {
+                work_done = Add(work_done, 1)
+                IfCondition EqualTo(hal_cmd, MessageTypes.MSG_SHUTDOWN) ThenBlock: {
+                    PrintMessage("[KERNEL] Shutdown requested\n")
+                    KernelState.running = 0
+                } ElseBlock: {
+                    HAL.WriteResponse(1)
+                }
+            }
+            messages_processed = 0
+            max_batch = 10
+            WhileLoop And(LessThan(messages_processed, max_batch), GreaterThan(MessageQueue.count, 0)) {
+                msg = Kernel.ReceiveMessage(0)
+                IfCondition NotEqual(msg, 0) ThenBlock: {
+                    messages_processed = Add(messages_processed, 1)
+                    work_done = Add(work_done, 1)
+                }
+            }
+            pin_changes = PinMonitor.CheckChanges()
+            IfCondition GreaterThan(pin_changes, 0) ThenBlock: {
+                work_done = Add(work_done, pin_changes)
+            }
+            loop_count = Add(loop_count, 1)
+            IfCondition EqualTo(Modulo(loop_count, 10000), 0) ThenBlock: {
+                KernelState.last_heartbeat = loop_count
+                HAL.UpdateStatus(1)
+                PrintMessage("[KERNEL] Heartbeat - ")
+                PrintNumber(loop_count)
+                PrintMessage(" iterations, ")
+                PrintNumber(PinMonitorState.pin_count)
+                PrintMessage(" pins\n")
+            }
+            IfCondition EqualTo(work_done, 0) ThenBlock: {
+                StoreValue(timespec_buf, 0)
+                StoreValue(Add(timespec_buf, 8), idle_ns)
+                SystemCall(35, timespec_buf, 0)
+            } ElseBlock: {
+                StoreValue(timespec_buf, 0)
+                StoreValue(Add(timespec_buf, 8), busy_ns)
+                SystemCall(35, timespec_buf, 0)
+            }
+        }
+        Deallocate(timespec_buf, 16)
+        PrintMessage("[KERNEL] Main loop exited\n")
+    }
+}
+
+Function.Kernel.Shutdown {
+    Body: {
+        PrintMessage("[KERNEL] Shutting down...\n")
+        i = 0
+        WhileLoop LessThan(i, KernelState.service_count) {
+            slot_offset = Multiply(i, 40)
+            slot_addr = Add(ServiceRegistry.services, slot_offset)
+            service_state = Dereference(slot_addr)
+            IfCondition EqualTo(service_state, ServiceStates.STATE_RUNNING) ThenBlock: {
+                pid = Dereference(Add(slot_addr, 8))
+                PrintMessage("[KERNEL] Terminating service ")
+                PrintNumber(i)
+                PrintMessage(" (PID ")
+                PrintNumber(pid)
+                PrintMessage(")\n")
+                ProcessKill(pid, 15)
+            }
+            i = Add(i, 1)
+        }
+        i = 0
+        WhileLoop LessThan(i, KernelState.service_count) {
+            slot_offset = Multiply(i, 40)
+            slot_addr = Add(ServiceRegistry.services, slot_offset)
+            pid = Dereference(Add(slot_addr, 8))
+            IfCondition GreaterThan(pid, 0) ThenBlock: {
+                ProcessWait(pid, 0)
+            }
+            i = Add(i, 1)
+        }
+        Deallocate(ServiceRegistry.services, 2560)
+        Deallocate(MessageQueue.queue, 8192)
+        Deallocate(HALInterface.shared_memory, 4096)
+        Deallocate(HALInterface.pin_shared_memory, MicroKernelConfig.PIN_SHARED_MEM_SIZE)
+        Deallocate(PinMonitorState.last_values, Multiply(MicroKernelConfig.MAX_PINS, 8))
+        Deallocate(PinMonitorState.pin_names, Multiply(MicroKernelConfig.MAX_PINS, 8))
+        PrintMessage("[KERNEL] Shutdown complete\n")
+    }
+}
+
+SubRoutine.Main {
+    PrintMessage("===========================================\n")
+    PrintMessage("HAL Microkernel with Pin Monitor\n")
+    PrintMessage("===========================================\n\n")
+    result = Kernel.Initialize()
+    IfCondition EqualTo(result, 0) ThenBlock: {
+        PrintMessage("FATAL: Kernel initialization failed\n")
+        ProcessExit(1)
+    }
+    PinMonitor.RegisterPin("spindle.speed")
+    PinMonitor.RegisterPin("axis.0.pos-cmd")
+    PinMonitor.RegisterPin("axis.1.pos-cmd")
+    PinMonitor.RegisterPin("estop.triggered")
+    daemon_pid = ProcessFork()
+    IfCondition GreaterThan(daemon_pid, 0) ThenBlock: {
+        PrintMessage("\n[MAIN] Kernel daemonized with PID: ")
+        PrintNumber(daemon_pid)
+        PrintMessage("\n[MAIN] Shared memory: /tmp/hal_pins.shm\n")
+        PrintMessage("[MAIN] To stop: kill -TERM ")
+        PrintNumber(daemon_pid)
+        PrintMessage("\n")
+        ProcessExit(0)
+    }
+    PrintMessage("\n[DAEMON] Starting persistent kernel...\n")
+    PrintMessage("[DAEMON] PID: ")
+    PrintNumber(ProcessGetPID())
+    PrintMessage("\n")
+    Kernel.MainLoop()
+    Kernel.Shutdown()
+    SystemCall(87, "/tmp/hal_pins.shm")
+    PrintMessage("\n[DAEMON] Microkernel stopped\n")
+    ProcessExit(0)
+}
+
+RunTask(Main)
