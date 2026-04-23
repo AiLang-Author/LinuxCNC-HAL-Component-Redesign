@@ -1,5 +1,5 @@
 
-# Currently Testing Code in simulation machine setup with real feedback, this grew into a entirely new CNC machine stack rather quickly. Expect Updates Fall 2026 !!!
+# Currently Testing Code in simulation machine setup with real feedback, Code in REPO IS STALE !!!!! This grew into a entirely new CNC machine stack rather quickly. Expect Updates Fall 2026 !!!
 
 # HAL Microkernel for LinuxCNC
 
