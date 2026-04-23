@@ -1,3 +1,6 @@
+
+# Currently Testing Code in simulation machine setup with real feedback, this grew into a entirely new CNC machine stack rather quickly. Expect Updates Fall 2026 !!!
+
 # HAL Microkernel for LinuxCNC
 
 A modern, non-blocking microkernel architecture for LinuxCNC HAL components, written in AILang and compiled to native x86-64 assembly.
